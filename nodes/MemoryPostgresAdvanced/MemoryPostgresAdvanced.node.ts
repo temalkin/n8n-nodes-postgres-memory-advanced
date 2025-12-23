@@ -781,16 +781,27 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 
 						// Fallback: extract text from last HumanMessage if values is empty
 						if (!inputText && regularMemory.chat_history && Array.isArray(regularMemory.chat_history)) {
+							this.logger.info(`Attempting to extract input from chat_history (${regularMemory.chat_history.length} messages)`);
 							const { HumanMessage } = await import('@langchain/core/messages');
 							// Find last HumanMessage in reverse order
 							for (let i = regularMemory.chat_history.length - 1; i >= 0; i--) {
 								const msg = regularMemory.chat_history[i];
-								// Check if message is HumanMessage using multiple methods
-								const isHumanMessage = 
-									msg instanceof HumanMessage || 
-									(msg as any).getType?.() === 'human' ||
-									(msg as any)._getType?.() === 'human' ||
-									((msg as any).id && Array.isArray((msg as any).id) && (msg as any).id.includes('HumanMessage'));
+								
+								// Check message type - handle both LangChain objects and serialized format
+								let msgType = '';
+								if (msg instanceof HumanMessage) {
+									msgType = 'instanceof';
+								} else if ((msg as any).getType) {
+									msgType = (msg as any).getType();
+								} else if ((msg as any)._getType) {
+									msgType = (msg as any)._getType();
+								} else if ((msg as any).id && Array.isArray((msg as any).id)) {
+									msgType = (msg as any).id.includes('HumanMessage') ? 'human' : '';
+								} else if ((msg as any).type) {
+									msgType = (msg as any).type;
+								}
+								
+								const isHumanMessage = msgType === 'human' || msg instanceof HumanMessage;
 								
 								if (isHumanMessage) {
 									// Extract content - handle both direct content and serialized format
@@ -801,15 +812,24 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 										content = typeof (msg as any).kwargs.content === 'string' 
 											? (msg as any).kwargs.content 
 											: JSON.stringify((msg as any).kwargs.content);
+									} else if ((msg as any).content) {
+										content = typeof (msg as any).content === 'string' 
+											? (msg as any).content 
+											: JSON.stringify((msg as any).content);
 									} else {
-										content = JSON.stringify(msg.content);
+										content = JSON.stringify(msg);
 									}
 									
 									if (content && content.trim()) {
 										inputText = content;
+										this.logger.info(`✅ Extracted input from HumanMessage: "${inputText.substring(0, 50)}..."`);
 										break;
 									}
 								}
+							}
+							
+							if (!inputText) {
+								this.logger.info(`⚠️ No HumanMessage found in chat_history to extract input from`);
 							}
 						}
 

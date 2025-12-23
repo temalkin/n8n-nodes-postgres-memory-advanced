@@ -779,10 +779,15 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 						// Perform semantic search if there's an input query
 						let inputText = values.input || values.question || '';
 						
-						this.logger.info(`Initial inputText from values: "${inputText}"`);
+						this.logger.info(`[Semantic Search] Initial inputText from values: "${inputText}"`);
+						this.logger.info(`[Semantic Search] loadedMessages check: isArray=${Array.isArray(loadedMessages)}, length=${loadedMessages?.length || 0}, type=${typeof loadedMessages}`);
+						
+						const shouldUseFallback = !inputText && Array.isArray(loadedMessages) && loadedMessages.length > 0;
+						this.logger.info(`[Semantic Search] Fallback condition: !inputText=${!inputText}, isArray=${Array.isArray(loadedMessages)}, length>0=${loadedMessages?.length > 0}, shouldUseFallback=${shouldUseFallback}`);
 
 						// Fallback: extract text from last HumanMessage if values is empty
-						if (!inputText && Array.isArray(loadedMessages) && loadedMessages.length > 0) {
+						if (shouldUseFallback) {
+							this.logger.info(`[Semantic Search] ✅ Fallback triggered - attempting to extract from ${loadedMessages.length} messages`);
 							this.logger.info(`Attempting to extract input from chat_history (${loadedMessages.length} messages)`);
 							const { HumanMessage } = await import('@langchain/core/messages');
 							// Find last HumanMessage in reverse order

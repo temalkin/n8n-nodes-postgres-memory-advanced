@@ -778,14 +778,17 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 					if (isWindowFull) {
 						// Perform semantic search if there's an input query
 						let inputText = values.input || values.question || '';
+						
+						this.logger.info(`Initial inputText from values: "${inputText}"`);
 
 						// Fallback: extract text from last HumanMessage if values is empty
-						if (!inputText && regularMemory.chat_history && Array.isArray(regularMemory.chat_history)) {
-							this.logger.info(`Attempting to extract input from chat_history (${regularMemory.chat_history.length} messages)`);
+						if (!inputText && Array.isArray(loadedMessages) && loadedMessages.length > 0) {
+							this.logger.info(`Attempting to extract input from chat_history (${loadedMessages.length} messages)`);
 							const { HumanMessage } = await import('@langchain/core/messages');
 							// Find last HumanMessage in reverse order
-							for (let i = regularMemory.chat_history.length - 1; i >= 0; i--) {
-								const msg = regularMemory.chat_history[i];
+							for (let i = loadedMessages.length - 1; i >= 0; i--) {
+								const msg = loadedMessages[i];
+								this.logger.info(`Message ${i}: type=${(msg as any).type || (msg as any).getType?.() || (msg as any)._getType?.() || 'unknown'}, hasContent=${!!(msg as any).content || !!(msg as any).kwargs?.content}`);
 								
 								// Check message type - handle both LangChain objects and serialized format
 								let msgType = '';

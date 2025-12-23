@@ -777,7 +777,42 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 					// Only perform semantic search if context window is full (meaning there are older messages not in recent context)
 					if (isWindowFull) {
 						// Perform semantic search if there's an input query
-						const inputText = values.input || values.question || '';
+						let inputText = values.input || values.question || '';
+
+						// Fallback: extract text from last HumanMessage if values is empty
+						if (!inputText && regularMemory.chat_history && Array.isArray(regularMemory.chat_history)) {
+							const { HumanMessage } = await import('@langchain/core/messages');
+							// Find last HumanMessage in reverse order
+							for (let i = regularMemory.chat_history.length - 1; i >= 0; i--) {
+								const msg = regularMemory.chat_history[i];
+								// Check if message is HumanMessage using multiple methods
+								const isHumanMessage = 
+									msg instanceof HumanMessage || 
+									(msg as any).getType?.() === 'human' ||
+									(msg as any)._getType?.() === 'human' ||
+									((msg as any).id && Array.isArray((msg as any).id) && (msg as any).id.includes('HumanMessage'));
+								
+								if (isHumanMessage) {
+									// Extract content - handle both direct content and serialized format
+									let content = '';
+									if (typeof msg.content === 'string') {
+										content = msg.content;
+									} else if ((msg as any).kwargs?.content) {
+										content = typeof (msg as any).kwargs.content === 'string' 
+											? (msg as any).kwargs.content 
+											: JSON.stringify((msg as any).kwargs.content);
+									} else {
+										content = JSON.stringify(msg.content);
+									}
+									
+									if (content && content.trim()) {
+										inputText = content;
+										break;
+									}
+								}
+							}
+						}
+
 						this.logger.info(`Input text for semantic search: "${inputText}"`);
 
 						if (inputText && typeof inputText === 'string') {

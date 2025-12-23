@@ -541,7 +541,7 @@ export class MemoryPostgresAdvanced implements INodeType {
 		let vectorStore: any = null;
 
 		if (enableSemanticSearch) {
-			this.logger.info('Semantic search enabled - checking for connected inputs...');
+			this.logger.info('Semantic search enabled - checking for connected inputs...---');
 			const vectorStoreInput = (await this.getInputConnectionData(NodeConnectionTypes.AiVectorStore, 0)) as any;
 
 			this.logger.info(`Vector Store input: ${vectorStoreInput ? 'CONNECTED' : 'NOT CONNECTED'}`);

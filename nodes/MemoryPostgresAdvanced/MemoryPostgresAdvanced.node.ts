@@ -730,8 +730,18 @@ export class MemoryPostgresAdvanced implements INodeType {
 				}
 
 				const results = await Promise.all(loadPromises);
-				const regularMemory = results[0];
+				let regularMemory = results[0];
 				const workingMemory = enableWorkingMemory && enableSessionTracking ? results[1] : null;
+
+				// Ensure regularMemory is always an object with chat_history array
+				if (!regularMemory || typeof regularMemory !== 'object') {
+					this.logger.warn('regularMemory is not an object, initializing default structure');
+					regularMemory = { chat_history: [] };
+				}
+				if (!regularMemory.chat_history || !Array.isArray(regularMemory.chat_history)) {
+					this.logger.warn('regularMemory.chat_history is not an array, initializing empty array');
+					regularMemory.chat_history = [];
+				}
 
 				this.logger.info(`✅ Memory loaded successfully`);
 
@@ -887,6 +897,13 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 								// Check if pool is exhausted - skip semantic search to prevent blocking
 								if (pool.totalCount >= 10 && pool.idleCount === 0) {
 									this.logger.warn('Postgres pool exhausted - skipping semantic search to prevent blocking. Consider increasing pool size or reducing concurrent requests.');
+									// Ensure regularMemory has correct structure before returning
+									if (!regularMemory || typeof regularMemory !== 'object') {
+										regularMemory = { chat_history: [] };
+									}
+									if (!regularMemory.chat_history || !Array.isArray(regularMemory.chat_history)) {
+										regularMemory.chat_history = [];
+									}
 									return regularMemory;
 								}
 								
@@ -1010,6 +1027,16 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 
 				// Log final pool state
 				this.logger.info(`Pool state at end of loadMemoryVariables: total=${pool.totalCount}, idle=${pool.idleCount}, waiting=${pool.waitingCount}`);
+
+				// Ensure regularMemory has correct structure before returning (prevent flatMap error)
+				if (!regularMemory || typeof regularMemory !== 'object') {
+					this.logger.warn('regularMemory is not an object at end, initializing default structure');
+					regularMemory = { chat_history: [] };
+				}
+				if (!regularMemory.chat_history || !Array.isArray(regularMemory.chat_history)) {
+					this.logger.warn('regularMemory.chat_history is not an array at end, initializing empty array');
+					regularMemory.chat_history = [];
+				}
 
 				return regularMemory;
 			};

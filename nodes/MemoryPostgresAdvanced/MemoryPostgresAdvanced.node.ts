@@ -47,6 +47,13 @@ async function configurePostgresPool(credentials: PostgresNodeCredentials): Prom
 		database: credentials.database,
 		user: credentials.user,
 		password: credentials.password,
+		// Limit pool size to prevent connection exhaustion
+		max: 10, // Maximum number of clients in the pool
+		min: 2, // Minimum number of clients in the pool
+		idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
+		connectionTimeoutMillis: 10000, // Return an error after 10 seconds if connection could not be established
+		// Close (and replace) a connection after it has been used for this many milliseconds
+		maxUses: 7500, // Close connection after ~2 hours of use to prevent stale connections
 	};
 
 	// Handle SSL configuration
@@ -68,7 +75,14 @@ async function configurePostgresPool(credentials: PostgresNodeCredentials): Prom
 		config.ssl = sslConfig;
 	}
 
-	return new pg.Pool(config);
+	const pool = new pg.Pool(config);
+
+	// Handle pool errors to prevent crashes
+	pool.on('error', (err: Error) => {
+		console.error('Unexpected error on idle client', err);
+	});
+
+	return pool;
 }
 
 // Create sessions table with required columns and indexes
@@ -541,10 +555,30 @@ export class MemoryPostgresAdvanced implements INodeType {
 		let vectorStore: any = null;
 
 		if (enableSemanticSearch) {
-			this.logger.info('Semantic search enabled - checking for connected inputs...---');
-			const vectorStoreInput = (await this.getInputConnectionData(NodeConnectionTypes.AiVectorStore, 0)) as any;
-
-			this.logger.info(`Vector Store input: ${vectorStoreInput ? 'CONNECTED' : 'NOT CONNECTED'}`);
+			this.logger.info('Semantic search enabled - checking for connected inputs...');
+			
+			// Add timeout for getting vector store connection (5 seconds)
+			const vectorStoreTimeout = 5000; // 5 seconds
+			const vectorStorePromise = this.getInputConnectionData(NodeConnectionTypes.AiVectorStore, 0);
+			const vectorStoreTimeoutPromise = new Promise((_, reject) => {
+				setTimeout(() => reject(new Error('Vector store connection timeout after 5 seconds')), vectorStoreTimeout);
+			});
+			
+			let vectorStoreInput: any;
+			try {
+				vectorStoreInput = await Promise.race([vectorStorePromise, vectorStoreTimeoutPromise]) as any;
+				this.logger.info(`Vector Store input: ${vectorStoreInput ? 'CONNECTED' : 'NOT CONNECTED'}`);
+			} catch (error: any) {
+				const errorMessage = error.message || String(error);
+				this.logger.error(`Failed to get vector store connection: ${errorMessage}`);
+				if (errorMessage.includes('timeout')) {
+					throw new NodeOperationError(
+						this.getNode(),
+						'Vector store connection timed out. Please check your vector store configuration and try again.'
+					);
+				}
+				throw error;
+			}
 
 			// Validate that vector store is connected when semantic search is enabled
 			if (!vectorStoreInput) {
@@ -569,6 +603,9 @@ export class MemoryPostgresAdvanced implements INodeType {
 
 		// Configure Postgres connection pool using helper function
 		const pool = await configurePostgresPool(credentials);
+		
+		// Log pool state for debugging connection issues
+		this.logger.info(`Postgres pool created: total=${pool.totalCount}, idle=${pool.idleCount}, waiting=${pool.waitingCount}`);
 
 		// Auto-create schema if it doesn't exist (only for non-public schemas)
 		if (schemaName && schemaName.toLowerCase() !== 'public') {
@@ -788,7 +825,6 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 						// Fallback: extract text from last HumanMessage if values is empty
 						if (shouldUseFallback) {
 							this.logger.info(`[Semantic Search] ✅ Fallback triggered - attempting to extract from ${loadedMessages.length} messages`);
-							this.logger.info(`Attempting to extract input from chat_history (${loadedMessages.length} messages)`);
 							const { HumanMessage } = await import('@langchain/core/messages');
 							// Find last HumanMessage in reverse order
 							for (let i = loadedMessages.length - 1; i >= 0; i--) {
@@ -845,12 +881,33 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 
 						if (inputText && typeof inputText === 'string') {
 							try {
+								// Log pool state before semantic search
+								this.logger.info(`Pool state before semantic search: total=${pool.totalCount}, idle=${pool.idleCount}, waiting=${pool.waitingCount}`);
+								
+								// Check if pool is exhausted - skip semantic search to prevent blocking
+								if (pool.totalCount >= 10 && pool.idleCount === 0) {
+									this.logger.warn('Postgres pool exhausted - skipping semantic search to prevent blocking. Consider increasing pool size or reducing concurrent requests.');
+									return regularMemory;
+								}
+								
 								// Use the vector store's internal similarity search and embedding model
 								this.logger.info('Using vector store\'s internal embedding model for query');
-								const allResults = await vectorStore.similaritySearchWithScore(
+								
+								// Add timeout for semantic search (30 seconds)
+								const searchTimeout = 30000; // 30 seconds
+								const searchPromise = vectorStore.similaritySearchWithScore(
 									inputText,
 									topK * 3 // Get more results to filter by session
 								);
+								
+								const timeoutPromise = new Promise((_, reject) => {
+									setTimeout(() => reject(new Error('Semantic search timeout after 30 seconds')), searchTimeout);
+								});
+								
+								const searchStartTime = Date.now();
+								const allResults = await Promise.race([searchPromise, timeoutPromise]) as any[];
+								const searchDuration = Date.now() - searchStartTime;
+								this.logger.info(`Semantic search completed in ${searchDuration}ms`);
 
 								// Filter results by sessionId and take top K
 								const results = allResults
@@ -865,10 +922,21 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 
 								// Retrieve and inject relevant messages directly into chat history
 								if (results.length > 0 && regularMemory.chat_history && Array.isArray(regularMemory.chat_history)) {
-									// Get all messages from chat history
-									const allMessages = await pgChatHistory.getMessages();
-									const retrievedMessages: any[] = [];
-									const seenIndices = new Set<number>();
+									try {
+										// Get all messages from chat history with timeout
+										const messagesTimeout = 10000; // 10 seconds
+										const messagesPromise = pgChatHistory.getMessages();
+										const messagesTimeoutPromise = new Promise((_, reject) => {
+											setTimeout(() => reject(new Error('Get messages timeout after 10 seconds')), messagesTimeout);
+										});
+										
+										const messagesStartTime = Date.now();
+										const allMessages = await Promise.race([messagesPromise, messagesTimeoutPromise]) as any[];
+										const messagesDuration = Date.now() - messagesStartTime;
+										this.logger.info(`Retrieved ${allMessages.length} messages from history in ${messagesDuration}ms`);
+										
+										const retrievedMessages: any[] = [];
+										const seenIndices = new Set<number>();
 
 									for (const result of results) {
 										const matchedContent = result[0].pageContent;
@@ -898,19 +966,39 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 										}
 									}
 
-									// Sort by original order and inject at the beginning with clear demarcation
-									if (retrievedMessages.length > 0) {
-										const { SystemMessage } = await import('@langchain/core/messages');
-										const startMarker = new SystemMessage('=== Relevant Context from Earlier Conversation ===');
-										const endMarker = new SystemMessage('=== Current Conversation ===');
-										regularMemory.chat_history.unshift(startMarker, ...retrievedMessages, endMarker);
-										this.logger.info(`✅ Injected ${retrievedMessages.length} context messages`);
-									} else {
-										this.logger.info('No semantic results found - skipping context injection');
+										// Sort by original order and inject at the beginning with clear demarcation
+										if (retrievedMessages.length > 0) {
+											const { SystemMessage } = await import('@langchain/core/messages');
+											const startMarker = new SystemMessage('=== Relevant Context from Earlier Conversation ===');
+											const endMarker = new SystemMessage('=== Current Conversation ===');
+											regularMemory.chat_history.unshift(startMarker, ...retrievedMessages, endMarker);
+											this.logger.info(`✅ Injected ${retrievedMessages.length} context messages`);
+										} else {
+											this.logger.info('No semantic results found - skipping context injection');
+										}
+									} catch (messagesError: any) {
+										const messagesErrorMessage = messagesError.message || String(messagesError);
+										this.logger.warn(`Failed to retrieve messages from history: ${messagesErrorMessage}`);
+										if (messagesErrorMessage.includes('timeout')) {
+											this.logger.warn('Get messages timed out - continuing without context injection to prevent blocking');
+										}
+										// Continue execution - don't block memory loading even if message retrieval fails
 									}
 								}
 							} catch (error: any) {
-								this.logger.warn(`Semantic search failed: ${error.message}`);
+								const errorMessage = error.message || String(error);
+								this.logger.warn(`Semantic search failed: ${errorMessage}`);
+								if (errorMessage.includes('timeout')) {
+									this.logger.warn('Semantic search timed out - continuing without semantic context to prevent blocking');
+								} else {
+									this.logger.warn(`Semantic search error details: ${JSON.stringify(error)}`);
+								}
+								// Log pool state after error
+								this.logger.info(`Pool state after semantic search error: total=${pool.totalCount}, idle=${pool.idleCount}, waiting=${pool.waitingCount}`);
+								// Continue execution - don't block memory loading even if semantic search fails
+							} finally {
+								// Log pool state after semantic search (success or failure)
+								this.logger.info(`Pool state after semantic search: total=${pool.totalCount}, idle=${pool.idleCount}, waiting=${pool.waitingCount}`);
 							}
 						} else {
 							this.logger.info('No input text provided - skipping semantic search');
@@ -919,6 +1007,9 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 						this.logger.info('Context window not full - skipping semantic search for better performance');
 					}
 				}
+
+				// Log final pool state
+				this.logger.info(`Pool state at end of loadMemoryVariables: total=${pool.totalCount}, idle=${pool.idleCount}, waiting=${pool.waitingCount}`);
 
 				return regularMemory;
 			};

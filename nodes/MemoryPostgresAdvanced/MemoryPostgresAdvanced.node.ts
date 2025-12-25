@@ -403,6 +403,53 @@ export class MemoryPostgresAdvanced implements INodeType {
 						},
 					},
 					{
+						displayName: 'Query Source',
+						name: 'querySource',
+						type: 'options',
+						options: [
+							{
+								name: 'From Input Values (values.input)',
+								value: 'input',
+								description: 'Use values.input for semantic search query',
+							},
+							{
+								name: 'From Question Values (values.question)',
+								value: 'question',
+								description: 'Use values.question for semantic search query',
+							},
+							{
+								name: 'From Last Human Message in History',
+								value: 'lastMessage',
+								description: 'Use the last HumanMessage from chat history (may be previous message if new one not yet loaded)',
+							},
+							{
+								name: 'Custom Expression',
+								value: 'custom',
+								description: 'Use custom expression to extract query text',
+							},
+						],
+						default: 'input',
+						description: 'Where to get the query text for semantic search',
+						displayOptions: {
+							show: {
+								enableSemanticSearch: [true],
+							},
+						},
+					},
+					{
+						displayName: 'Custom Query Expression',
+						name: 'customQueryExpression',
+						type: 'string',
+						default: '={{ $json.input || $json.question || "" }}',
+						description: 'Expression to extract query text (e.g., ={{ $json.input }})',
+						displayOptions: {
+							show: {
+								enableSemanticSearch: [true],
+								querySource: ['custom'],
+							},
+						},
+					},
+					{
 						displayName: 'User ID',
 						name: 'userId',
 						type: 'string',
@@ -530,6 +577,8 @@ export class MemoryPostgresAdvanced implements INodeType {
 			enableWorkingMemory?: boolean;
 			workingMemoryScope?: 'thread' | 'user';
 			workingMemoryTemplate?: string;
+			querySource?: 'input' | 'question' | 'lastMessage' | 'custom';
+			customQueryExpression?: string;
 		};
 		const enableSessionTracking = options.enableSessionTracking || false;
 		const sessionsTableName = options.sessionsTableName || 'n8n_chat_sessions';
@@ -550,6 +599,8 @@ export class MemoryPostgresAdvanced implements INodeType {
   "projects": [],
   "preferences": {}
 }`;
+		const querySource = options.querySource || 'input';
+		const customQueryExpression = options.customQueryExpression || '={{ $json.input || $json.question || "" }}';
 
 		// Get connected vector store for semantic search
 		let vectorStore: any = null;
@@ -714,6 +765,7 @@ export class MemoryPostgresAdvanced implements INodeType {
 		if (enableWorkingMemory || enableSemanticSearch) {
 			const originalLoadMemoryVariables = memory.loadMemoryVariables.bind(memory);
 			const contextWindowLength = this.getNode().typeVersion < 1.1 ? Infinity : (kOptions.k as number);
+			const supplyDataContext = this; // Save reference to supplyData context for evaluateExpression
 
 			memory.loadMemoryVariables = async (values: any) => {
 				this.logger.info(`loadMemoryVariables called with values: ${JSON.stringify(values)}`);
@@ -733,14 +785,20 @@ export class MemoryPostgresAdvanced implements INodeType {
 				let regularMemory = results[0];
 				const workingMemory = enableWorkingMemory && enableSessionTracking ? results[1] : null;
 
-				// Ensure regularMemory is always an object with chat_history array
+				// Ensure regularMemory is always an object with chat_history array (prevent flatMap/map error)
+				// Use safe approach as recommended in n8n community
 				if (!regularMemory || typeof regularMemory !== 'object') {
 					this.logger.warn('regularMemory is not an object, initializing default structure');
 					regularMemory = { chat_history: [] };
 				}
-				if (!regularMemory.chat_history || !Array.isArray(regularMemory.chat_history)) {
+				// Safe array access - ensure chat_history is always an array (never undefined)
+				const initialChatHistory = regularMemory.chat_history || [];
+				if (!Array.isArray(initialChatHistory)) {
 					this.logger.warn('regularMemory.chat_history is not an array, initializing empty array');
 					regularMemory.chat_history = [];
+				} else {
+					// Ensure it's properly initialized
+					regularMemory.chat_history = initialChatHistory;
 				}
 
 				this.logger.info(`✅ Memory loaded successfully`);
@@ -823,68 +881,90 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 
 					// Only perform semantic search if context window is full (meaning there are older messages not in recent context)
 					if (isWindowFull) {
-						// Perform semantic search if there's an input query
-						let inputText = values.input || values.question || '';
+						// Extract query text based on selected source
+						let inputText = '';
 						
-						this.logger.info(`[Semantic Search] Initial inputText from values: "${inputText}"`);
-						this.logger.info(`[Semantic Search] loadedMessages check: isArray=${Array.isArray(loadedMessages)}, length=${loadedMessages?.length || 0}, type=${typeof loadedMessages}`);
+						this.logger.info(`[Semantic Search] Query source: ${querySource}`);
 						
-						const shouldUseFallback = !inputText && Array.isArray(loadedMessages) && loadedMessages.length > 0;
-						this.logger.info(`[Semantic Search] Fallback condition: !inputText=${!inputText}, isArray=${Array.isArray(loadedMessages)}, length>0=${loadedMessages?.length > 0}, shouldUseFallback=${shouldUseFallback}`);
-
-						// Fallback: extract text from last HumanMessage if values is empty
-						if (shouldUseFallback) {
-							this.logger.info(`[Semantic Search] ✅ Fallback triggered - attempting to extract from ${loadedMessages.length} messages`);
-							const { HumanMessage } = await import('@langchain/core/messages');
-							// Find last HumanMessage in reverse order
-							for (let i = loadedMessages.length - 1; i >= 0; i--) {
-								const msg = loadedMessages[i];
-								this.logger.info(`Message ${i}: type=${(msg as any).type || (msg as any).getType?.() || (msg as any)._getType?.() || 'unknown'}, hasContent=${!!(msg as any).content || !!(msg as any).kwargs?.content}`);
-								
-								// Check message type - handle both LangChain objects and serialized format
-								let msgType = '';
-								if (msg instanceof HumanMessage) {
-									msgType = 'instanceof';
-								} else if ((msg as any).getType) {
-									msgType = (msg as any).getType();
-								} else if ((msg as any)._getType) {
-									msgType = (msg as any)._getType();
-								} else if ((msg as any).id && Array.isArray((msg as any).id)) {
-									msgType = (msg as any).id.includes('HumanMessage') ? 'human' : '';
-								} else if ((msg as any).type) {
-									msgType = (msg as any).type;
-								}
-								
-								const isHumanMessage = msgType === 'human' || msg instanceof HumanMessage;
-								
-								if (isHumanMessage) {
-									// Extract content - handle both direct content and serialized format
-									let content = '';
-									if (typeof msg.content === 'string') {
-										content = msg.content;
-									} else if ((msg as any).kwargs?.content) {
-										content = typeof (msg as any).kwargs.content === 'string' 
-											? (msg as any).kwargs.content 
-											: JSON.stringify((msg as any).kwargs.content);
-									} else if ((msg as any).content) {
-										content = typeof (msg as any).content === 'string' 
-											? (msg as any).content 
-											: JSON.stringify((msg as any).content);
-									} else {
-										content = JSON.stringify(msg);
+						if (querySource === 'input') {
+							inputText = values.input || '';
+							this.logger.info(`[Semantic Search] Using values.input: "${inputText ? inputText.substring(0, 50) + '...' : '(empty)'}"`);
+						} else if (querySource === 'question') {
+							inputText = values.question || '';
+							this.logger.info(`[Semantic Search] Using values.question: "${inputText ? inputText.substring(0, 50) + '...' : '(empty)'}"`);
+						} else if (querySource === 'custom') {
+							try {
+								inputText = supplyDataContext.evaluateExpression(customQueryExpression, itemIndex) as string || '';
+								this.logger.info(`[Semantic Search] Using custom expression: "${inputText ? inputText.substring(0, 50) + '...' : '(empty)'}"`);
+							} catch (error: any) {
+								this.logger.warn(`[Semantic Search] Failed to evaluate custom expression: ${error.message}`);
+								inputText = '';
+							}
+						} else if (querySource === 'lastMessage') {
+							// Extract from last HumanMessage in history
+							this.logger.info(`[Semantic Search] loadedMessages check: isArray=${Array.isArray(loadedMessages)}, length=${loadedMessages?.length || 0}, type=${typeof loadedMessages}`);
+							
+							if (Array.isArray(loadedMessages) && loadedMessages.length > 0) {
+								this.logger.info(`[Semantic Search] Extracting input from last HumanMessage in ${loadedMessages.length} messages`);
+								const { HumanMessage } = await import('@langchain/core/messages');
+								// Find last HumanMessage in reverse order
+								for (let i = loadedMessages.length - 1; i >= 0; i--) {
+									const msg = loadedMessages[i];
+									this.logger.info(`Message ${i}: type=${(msg as any).type || (msg as any).getType?.() || (msg as any)._getType?.() || 'unknown'}, hasContent=${!!(msg as any).content || !!(msg as any).kwargs?.content}`);
+									
+									// Check message type - handle both LangChain objects and serialized format
+									let msgType = '';
+									if (msg instanceof HumanMessage) {
+										msgType = 'instanceof';
+									} else if ((msg as any).getType) {
+										msgType = (msg as any).getType();
+									} else if ((msg as any)._getType) {
+										msgType = (msg as any)._getType();
+									} else if ((msg as any).id && Array.isArray((msg as any).id)) {
+										msgType = (msg as any).id.includes('HumanMessage') ? 'human' : '';
+									} else if ((msg as any).type) {
+										msgType = (msg as any).type;
 									}
 									
-									if (content && content.trim()) {
-										inputText = content;
-										this.logger.info(`✅ Extracted input from HumanMessage: "${inputText.substring(0, 50)}..."`);
-										break;
+									const isHumanMessage = msgType === 'human' || msg instanceof HumanMessage;
+									
+									if (isHumanMessage) {
+										// Extract content - handle both direct content and serialized format
+										let content = '';
+										if (typeof msg.content === 'string') {
+											content = msg.content;
+										} else if ((msg as any).kwargs?.content) {
+											content = typeof (msg as any).kwargs.content === 'string' 
+												? (msg as any).kwargs.content 
+												: JSON.stringify((msg as any).kwargs.content);
+										} else if ((msg as any).content) {
+											content = typeof (msg as any).content === 'string' 
+												? (msg as any).content 
+												: JSON.stringify((msg as any).content);
+										} else {
+											content = JSON.stringify(msg);
+										}
+										
+										if (content && content.trim()) {
+											inputText = content;
+											this.logger.info(`✅ Extracted input from HumanMessage: "${inputText ? inputText.substring(0, 50) + '...' : '(empty)'}"`);
+											break;
+										}
 									}
 								}
+								
+								if (!inputText) {
+									this.logger.info(`⚠️ No HumanMessage found in chat_history to extract input from`);
+								}
+							} else {
+								// Fallback to values.input or values.question if no messages in history
+								inputText = values.input || values.question || '';
+								this.logger.info(`[Semantic Search] No messages in history, using fallback: "${inputText}"`);
 							}
-							
-							if (!inputText) {
-								this.logger.info(`⚠️ No HumanMessage found in chat_history to extract input from`);
-							}
+						} else {
+							// Fallback for unexpected querySource values
+							this.logger.warn(`[Semantic Search] Unknown querySource value: ${querySource}, falling back to values.input`);
+							inputText = values.input || values.question || '';
 						}
 
 						this.logger.info(`Input text for semantic search: "${inputText}"`);
@@ -897,10 +977,18 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 								// Check if pool is exhausted - skip semantic search to prevent blocking
 								if (pool.totalCount >= 10 && pool.idleCount === 0) {
 									this.logger.warn('Postgres pool exhausted - skipping semantic search to prevent blocking. Consider increasing pool size or reducing concurrent requests.');
-									// Ensure regularMemory has correct structure before returning
+									// Ensure regularMemory has correct structure before returning (prevent flatMap/map error)
 									if (!regularMemory || typeof regularMemory !== 'object') {
 										regularMemory = { chat_history: [] };
 									}
+									// Safe array access - ensure chat_history is always an array (never undefined)
+									const chatHistory = regularMemory.chat_history || [];
+									if (!Array.isArray(chatHistory)) {
+										regularMemory.chat_history = [];
+									} else {
+										regularMemory.chat_history = (chatHistory || []).filter((msg: any) => msg != null && typeof msg === 'object');
+									}
+									// Final safety check
 									if (!regularMemory.chat_history || !Array.isArray(regularMemory.chat_history)) {
 										regularMemory.chat_history = [];
 									}
@@ -1022,20 +1110,73 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 						}
 					} else {
 						this.logger.info('Context window not full - skipping semantic search for better performance');
+						// When window is not full, ensure chat_history is properly normalized
+						// This prevents flatMap errors when BufferWindowMemory returns unexpected structure
+						// This is especially important when contextWindowLength > actual message count
+						this.logger.info(`[Window Not Full] regularMemory.chat_history type: ${typeof regularMemory.chat_history}, isArray: ${Array.isArray(regularMemory.chat_history)}, length: ${regularMemory.chat_history?.length || 'N/A'}`);
+						
+						if (!regularMemory.chat_history || !Array.isArray(regularMemory.chat_history)) {
+							this.logger.warn('chat_history is not an array when window not full, normalizing...');
+							regularMemory.chat_history = [];
+						} else {
+							// Normalize array - filter out undefined/null and ensure all items are objects
+							const chatHistory = regularMemory.chat_history || [];
+							const originalLength = chatHistory.length;
+							regularMemory.chat_history = (chatHistory || [])
+								.filter((msg: any) => msg != null && typeof msg === 'object');
+							
+							if (regularMemory.chat_history.length !== originalLength) {
+								this.logger.warn(`[Window Not Full] Filtered out ${originalLength - regularMemory.chat_history.length} invalid messages`);
+							}
+						}
 					}
 				}
 
 				// Log final pool state
 				this.logger.info(`Pool state at end of loadMemoryVariables: total=${pool.totalCount}, idle=${pool.idleCount}, waiting=${pool.waitingCount}`);
 
-				// Ensure regularMemory has correct structure before returning (prevent flatMap error)
+				// Ensure regularMemory has correct structure before returning (prevent flatMap/map error)
+				// Use safe approach as recommended in n8n community: https://community.n8n.io/t/cannot-read-properties-of-undefined-reading-map/158143/2
 				if (!regularMemory || typeof regularMemory !== 'object') {
 					this.logger.warn('regularMemory is not an object at end, initializing default structure');
 					regularMemory = { chat_history: [] };
 				}
-				if (!regularMemory.chat_history || !Array.isArray(regularMemory.chat_history)) {
+				
+				// Safe array access - ensure chat_history is always an array (never undefined)
+				const chatHistory = regularMemory.chat_history || [];
+				if (!Array.isArray(chatHistory)) {
 					this.logger.warn('regularMemory.chat_history is not an array at end, initializing empty array');
 					regularMemory.chat_history = [];
+				} else {
+					// Normalize chat_history array - filter out any undefined/null items and ensure all items are objects
+					// Use safe approach: (array || []).filter().map() to prevent undefined errors
+					const originalLength = chatHistory.length;
+					regularMemory.chat_history = (chatHistory || [])
+						.filter((msg: any) => msg != null && typeof msg === 'object')
+						.map((msg: any) => {
+							// Ensure message has required structure - if it's missing critical fields, log warning
+							if (!msg.lc && !msg.content && !msg.kwargs && !msg.getType) {
+								this.logger.warn('Message in chat_history has unexpected structure:', JSON.stringify(msg).substring(0, 100));
+							}
+							return msg;
+						});
+					
+					if (regularMemory.chat_history.length !== originalLength) {
+						this.logger.warn(`Filtered out ${originalLength - regularMemory.chat_history.length} invalid messages from chat_history`);
+					}
+				}
+				
+				// Final safety check - ensure chat_history is always an array (never undefined or null)
+				if (!regularMemory.chat_history || !Array.isArray(regularMemory.chat_history)) {
+					regularMemory.chat_history = [];
+				}
+
+				// Log structure for debugging
+				this.logger.info(`Returning regularMemory: chat_history length=${regularMemory.chat_history.length}, type=${typeof regularMemory.chat_history}`);
+				if (regularMemory.chat_history.length > 0) {
+					const firstMsg = regularMemory.chat_history[0];
+					const firstMsgStr = JSON.stringify(firstMsg).substring(0, 200);
+					this.logger.info(`First message structure: ${firstMsgStr}`);
 				}
 
 				return regularMemory;

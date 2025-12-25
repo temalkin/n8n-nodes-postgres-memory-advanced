@@ -1156,7 +1156,7 @@ The goal is EXTENSIBLE SCHEMA: structured base + dynamic field addition as users
 						.map((msg: any) => {
 							// Ensure message has required structure - if it's missing critical fields, log warning
 							if (!msg.lc && !msg.content && !msg.kwargs && !msg.getType) {
-								this.logger.warn('Message in chat_history has unexpected structure:', JSON.stringify(msg).substring(0, 100));
+								this.logger.warn(`Message in chat_history has unexpected structure: ${JSON.stringify(msg).substring(0, 100)}`);
 							}
 							return msg;
 						});

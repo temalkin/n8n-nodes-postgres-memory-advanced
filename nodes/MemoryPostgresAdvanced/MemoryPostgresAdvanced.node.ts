@@ -49,8 +49,8 @@ async function configurePostgresPool(credentials: PostgresNodeCredentials): Prom
 		password: credentials.password,
 		// Limit pool size to prevent connection exhaustion
 		max: 10, // Maximum number of clients in the pool
-		min: 2, // Minimum number of clients in the pool
-		idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
+		min: 0, // Minimum number of clients in the pool (0 = close idle connections immediately when not needed)
+		idleTimeoutMillis: 10000, // Close idle clients after 10 seconds (before server timeout)
 		connectionTimeoutMillis: 10000, // Return an error after 10 seconds if connection could not be established
 		// Close (and replace) a connection after it has been used for this many milliseconds
 		maxUses: 7500, // Close connection after ~2 hours of use to prevent stale connections
@@ -78,8 +78,22 @@ async function configurePostgresPool(credentials: PostgresNodeCredentials): Prom
 	const pool = new pg.Pool(config);
 
 	// Handle pool errors to prevent crashes
-	pool.on('error', (err: Error) => {
-		console.error('Unexpected error on idle client', err);
+	// Only log error message and code, not the entire error object to avoid huge logs
+	pool.on('error', (err: any) => {
+		// Ignore idle session timeout errors (57P05) - these are normal when server closes idle connections
+		// Pool will automatically reconnect on next query
+		if (err?.code === '57P05' || (err?.message && err.message.includes('idle-session timeout'))) {
+			// Silently ignore - this is expected behavior
+			return;
+		}
+		
+		// Log only essential error information, not the entire client object
+		const errorInfo = {
+			message: err?.message || 'Unknown error',
+			code: err?.code || 'UNKNOWN',
+			severity: err?.severity || 'ERROR',
+		};
+		console.error('Unexpected error on idle client:', JSON.stringify(errorInfo));
 	});
 
 	return pool;

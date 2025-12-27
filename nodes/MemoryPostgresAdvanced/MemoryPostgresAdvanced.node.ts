@@ -386,6 +386,43 @@ export class MemoryPostgresAdvanced implements INodeType {
 						description: 'Whether to enable semantic search using embeddings and vector store (requires Vector Store input to be connected)',
 					},
 					{
+						displayName: 'Custom Metadata',
+						name: 'customMetadata',
+						type: 'fixedCollection',
+						description: 'Additional metadata fields to store alongside message embeddings',
+						typeOptions: {
+							multipleValues: true,
+						},
+						default: {},
+						placeholder: 'Add property',
+						options: [
+							{
+								name: 'metadataValues',
+								displayName: 'Fields to Set',
+								values: [
+									{
+										displayName: 'Name',
+										name: 'name',
+										type: 'string',
+										default: '',
+										required: true,
+									},
+									{
+										displayName: 'Value',
+										name: 'value',
+										type: 'string',
+										default: '',
+									},
+								],
+							},
+						],
+						displayOptions: {
+							show: {
+								enableSemanticSearch: [true],
+							},
+						},
+					},
+					{
 						displayName: 'Session Tracking',
 						name: 'enableSessionTracking',
 						type: 'boolean',
@@ -586,6 +623,12 @@ export class MemoryPostgresAdvanced implements INodeType {
 			sessionsTableName?: string;
 			userId?: string;
 			enableSemanticSearch?: boolean;
+			customMetadata?: {
+				metadataValues?: Array<{
+					name: string;
+					value?: string;
+				}>;
+			};
 			topK?: number;
 			messageRange?: number;
 			enableWorkingMemory?: boolean;
@@ -598,6 +641,7 @@ export class MemoryPostgresAdvanced implements INodeType {
 		const sessionsTableName = options.sessionsTableName || 'n8n_chat_sessions';
 		const userId = enableSessionTracking ? (options.userId || '') : '';
 		const enableSemanticSearch = options.enableSemanticSearch || false;
+		const customMetadataValues = options.customMetadata?.metadataValues ?? [];
 		const topK = options.topK || 3;
 		const messageRange = options.messageRange || 2;
 		const enableWorkingMemory = options.enableWorkingMemory || false;
@@ -743,12 +787,30 @@ export class MemoryPostgresAdvanced implements INodeType {
 				if (enableSemanticSearch && vectorStore) {
 					(async () => {
 						try {
+							const reservedMetadataKeys = new Set(['sessionId', 'messageType', 'timestamp']);
+							const customMetadata: Record<string, string> = {};
+
+							for (const pair of customMetadataValues) {
+								const key = (pair?.name ?? '').toString().trim();
+								if (!key) continue;
+
+								if (reservedMetadataKeys.has(key)) {
+									this.logger.warn(
+										`Custom metadata key "${key}" is reserved and cannot be overridden. Skipping.`,
+									);
+									continue;
+								}
+
+								customMetadata[key] = pair?.value ?? '';
+							}
+
 							await vectorStore.addDocuments([{
 								pageContent: messageContent,
 								metadata: {
 									sessionId,
 									messageType: message._getType(),
 									timestamp: new Date().toISOString(),
+									...customMetadata,
 								}
 							}]);
 							this.logger.info(`✅ Message embedded and stored in vector store`);
